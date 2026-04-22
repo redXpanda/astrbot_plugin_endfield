@@ -56,5 +56,10 @@
     "description": "理智订阅轮询间隔（分钟）",
     "type": "int",
     "default": 20
+  },
+  "ssrf_protection": {
+    "description": "是否启用 SSRF 防护（远程图片下载时校验 IP，部分网络环境下可能误拦截正常请求，可关闭）",
+    "type": "bool",
+    "default": true
   }
 }

@@ -158,6 +158,7 @@ class EndfieldPlugin(Star):
         self.auto_sign_in_interval = (
             config.get("auto_sign_in_interval", 3) if config else 3
         )
+        self.ssrf_protection = config.get("ssrf_protection", True) if config else True
         self.auto_sign_in_notify_group = (
             config.get("auto_sign_in_notify_group", "") if config else ""
         )
@@ -297,32 +298,33 @@ class EndfieldPlugin(Star):
                     ext = ".png"
 
             # Async SSRF prevention - non-blocking DNS resolution
-            try:
-                parsed_url = urlparse(rp)
-                hostname = parsed_url.hostname
-                if not hostname:
-                    return ""
-                loop = asyncio.get_event_loop()
-                addr_info = await loop.getaddrinfo(hostname, None)
-                for addr in addr_info:
-                    ip = addr[4][0]
-                    ip_obj = ipaddress.ip_address(ip)
-                    if (
-                        ip_obj.is_private
-                        or ip_obj.is_loopback
-                        or ip_obj.is_unspecified
-                        or ip_obj.is_link_local
-                        or ip_obj.is_multicast
-                    ):
-                        logger.warning(
-                            f"Blocked potential SSRF access to {rp} (Resolved IP: {ip})"
-                        )
+            if self.ssrf_protection:
+                try:
+                    parsed_url = urlparse(rp)
+                    hostname = parsed_url.hostname
+                    if not hostname:
                         return ""
-            except Exception as e:
-                logger.warning(
-                    f"Blocked potential SSRF access to {rp} due to resolving error: {e}"
-                )
-                return ""
+                    loop = asyncio.get_event_loop()
+                    addr_info = await loop.getaddrinfo(hostname, None)
+                    for addr in addr_info:
+                        ip = addr[4][0]
+                        ip_obj = ipaddress.ip_address(ip)
+                        if (
+                            ip_obj.is_private
+                            or ip_obj.is_loopback
+                            or ip_obj.is_unspecified
+                            or ip_obj.is_link_local
+                            or ip_obj.is_multicast
+                        ):
+                            logger.warning(
+                                f"Blocked potential SSRF access to {rp} (Resolved IP: {ip})"
+                            )
+                            return ""
+                except Exception as e:
+                    logger.warning(
+                        f"Blocked potential SSRF access to {rp} due to resolving error: {e}"
+                    )
+                    return ""
 
             cache_file = os.path.join(cache_dir, f"{url_hash}{ext}")
             if os.path.exists(cache_file):
