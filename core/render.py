@@ -241,7 +241,19 @@ class Renderer:
                 if not self._playwright:
                     self._playwright = await async_playwright().start()
                 if not self._browser:
-                    self._browser = await self._playwright.chromium.launch()
+                    try:
+                        self._browser = await self._playwright.chromium.launch()
+                    except Exception as launch_err:
+                        logger.warning(
+                            f"[Endfield Render] Chromium launch failed: {launch_err}, "
+                            "attempting auto-install..."
+                        )
+                        import subprocess, sys
+                        subprocess.run(
+                            [sys.executable, "-m", "playwright", "install", "chromium"],
+                            check=True,
+                        )
+                        self._browser = await self._playwright.chromium.launch()
 
             # Long scrolling pages (like announcements) exceed Chromium's 16384px GPU limit
             # when using device_scale_factor=2. Force factor=1 for those templates.
