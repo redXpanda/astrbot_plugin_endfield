@@ -3146,9 +3146,7 @@ class EndfieldPlugin(Star):
                         try:
                             chain = MessageChain()
                             if url:
-                                # Standardize path for Windows
-                                img_path = os.path.normpath(url.replace("file:///", ""))
-                                chain.chain.append(Image.fromFileSystem(img_path))
+                                chain.chain.append(Image.fromFileSystem(url))
                             else:
                                 msg = f"【终末地新公告】\n{latest.get('title')}\n{latest.get('summary') or ''}"
                                 chain.chain.append(Plain(msg))

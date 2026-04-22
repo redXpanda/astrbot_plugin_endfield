@@ -1,6 +1,5 @@
 import os
 import re
-import asyncio
 import base64
 import mimetypes
 import jinja2
@@ -10,9 +9,7 @@ from typing import Dict, Any, Optional
 
 
 class Renderer:
-    # Class-level Jinja2 environment for template caching / reuse
     _jinja_env: Optional[jinja2.Environment] = None
-    _cache_cleanup_task: Optional[asyncio.Task] = None
 
     @classmethod
     def _get_jinja_env(cls) -> jinja2.Environment:
@@ -27,44 +24,8 @@ class Renderer:
         self.plugin = plugin
         self.res_path = res_path
         self.render_timeout = render_timeout
-        self._browser = None
-        self._playwright = None
-        self._lock = asyncio.Lock()
-        self._output_dir = os.path.abspath(os.path.join(self.res_path, "render_cache"))
-        os.makedirs(self._output_dir, exist_ok=True)
-        # Start background cache cleanup task if not already running
-        if Renderer._cache_cleanup_task is None or Renderer._cache_cleanup_task.done():
-            Renderer._cache_cleanup_task = asyncio.create_task(
-                self._cache_cleanup_loop()
-            )
-
-    async def _cache_cleanup_loop(self):
-        """Background task: clean render cache files older than 5 minutes every 60s."""
-        while True:
-            try:
-                await asyncio.sleep(60)
-                cutoff = asyncio.get_event_loop().time() - 300
-                import time as _time
-
-                now = _time.time()
-                for f in os.listdir(self._output_dir):
-                    if not f.startswith("render_"):
-                        continue
-                    fp = os.path.join(self._output_dir, f)
-                    try:
-                        if now - os.path.getmtime(fp) > 300:
-                            os.remove(fp)
-                    except Exception as e:
-                        logger.debug(
-                            f"[Endfield Render] Cache cleanup failed for {f}: {e}"
-                        )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.debug(f"[Endfield Render] Cache cleanup loop error: {e}")
 
     def get_res_path(self, sub_path: str) -> str:
-        """Returns the absolute file URL for a resource sub-path."""
         return "file:///" + os.path.abspath(
             os.path.join(self.res_path, sub_path)
         ).replace("\\", "/")
@@ -79,7 +40,7 @@ class Renderer:
     async def render_html(
         self, template_name: str, data: Dict[str, Any], options: Optional[Dict] = None
     ) -> Optional[str]:
-        """Entry point for rendering HTML templates to images using Playwright."""
+        """Render HTML template to image via AstrBot framework html_render."""
         tmpl_content = self.get_template(template_name)
         if not tmpl_content:
             return None
@@ -90,11 +51,32 @@ class Renderer:
         if not html_content:
             return None
 
-        return await self._screenshot(html_content, template_name, options)
+        # Wrap in {% raw %} to prevent the framework t2i service from
+        # interpreting any Jinja2-like syntax in the already-rendered HTML
+        safe_html = "{% raw %}" + html_content + "{% endraw %}"
+
+        render_options = {
+            "full_page": True,
+            "type": "png",
+            "timeout": self.render_timeout,
+        }
+        if options:
+            render_options.update(options)
+
+        try:
+            result = await self.plugin.html_render(
+                tmpl=safe_html,
+                data={},
+                return_url=False,
+                options=render_options,
+            )
+            return result
+        except Exception as e:
+            logger.error(f"[Endfield Render] html_render error: {e}")
+            return None
 
     def _adapt_template(self, content: str) -> str:
         """Converts Yunzai (art-template) syntax to Jinja2."""
-        # Handle $index before $value to avoid partial replacements
         adapted = content.replace("$index+1", "loop.index").replace(
             "$index", "loop.index0"
         )
@@ -158,14 +140,13 @@ class Renderer:
         return adapted
 
     def _inline_assets(self, html: str) -> str:
-        """Inlines CSS and Images to ensure Playwright renders them correctly."""
+        """Inlines CSS and Images to ensure rendering works correctly."""
 
         def inline_css(match):
             path = os.path.join(self.res_path, match.group(1))
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     css_content = f.read()
-                # Strip any art-template / Jinja2-like expressions from CSS to avoid Jinja2 parse errors
                 css_content = self._adapt_template(css_content)
                 return f"<style>\n{css_content}\n</style>"
             return ""
@@ -199,7 +180,6 @@ class Renderer:
             html,
         )
 
-        # Also handle inline style="...url({{pluResPath}}...)..." in HTML element attributes
         def inline_style_bg(m):
             path = os.path.join(self.res_path, m.group(1))
             if os.path.exists(path):
@@ -225,99 +205,5 @@ class Renderer:
             logger.error(f"[Endfield Render] Jinja2 error: {e}")
             return None
 
-    async def _screenshot(
-        self, html: str, name: str, options: Optional[Dict]
-    ) -> Optional[str]:
-        """Uses Playwright to capture a screenshot of the rendered HTML."""
-        from playwright.async_api import async_playwright
-        import uuid
-
-        output_path = os.path.join(
-            self._output_dir, f"render_{uuid.uuid4().hex[:8]}.png"
-        )
-
-        try:
-            async with self._lock:
-                if not self._playwright:
-                    self._playwright = await async_playwright().start()
-                if not self._browser:
-                    try:
-                        self._browser = await self._playwright.chromium.launch()
-                    except Exception as launch_err:
-                        logger.warning(
-                            f"[Endfield Render] Chromium launch failed: {launch_err}, "
-                            "attempting auto-install..."
-                        )
-                        import subprocess, sys
-                        subprocess.run(
-                            [sys.executable, "-m", "playwright", "install", "chromium"],
-                            check=True,
-                        )
-                        self._browser = await self._playwright.chromium.launch()
-
-            # Long scrolling pages (like announcements) exceed Chromium's 16384px GPU limit
-            # when using device_scale_factor=2. Force factor=1 for those templates.
-            scale_factor = 1.0 if "announcement" in name else 2.0
-            
-            context = await self._browser.new_context(
-                device_scale_factor=scale_factor, viewport={"width": 1300, "height": 800}
-            )
-            page = await context.new_page()
-
-            temp_html = os.path.join(
-                os.path.dirname(os.path.abspath(os.path.join(self.res_path, name))),
-                f"tmp_{uuid.uuid4().hex[:8]}.html",
-            )
-            with open(temp_html, "w", encoding="utf-8") as f:
-                f.write(html)
-
-            try:
-                await page.goto(
-                    f"file:///{temp_html.replace(chr(92), '/')}",
-                    wait_until="networkidle",
-                    timeout=self.render_timeout,
-                )
-                # Ensure all dynamic images are fully loaded so the bounding box is correct
-                await page.evaluate('''
-                    Promise.all(Array.from(document.images).map(img => {
-                        if (img.complete) return Promise.resolve();
-                        return new Promise(resolve => {
-                            img.onload = resolve;
-                            img.onerror = resolve;
-                        });
-                    }))
-                ''')
-                await page.wait_for_timeout(200)
-                el = await page.evaluate_handle("document.body.firstElementChild")
-                box = await el.bounding_box() if el else None
-                if box:
-                    await page.set_viewport_size(
-                        {
-                            "width": int(box["width"]) + 2,
-                            "height": int(box["height"]) + 2,
-                        }
-                    )
-                    await page.screenshot(path=output_path, clip=box, type="jpeg")
-                else:
-                    await page.screenshot(path=output_path, full_page=True)
-                if el:
-                    await el.dispose()
-            finally:
-                if os.path.exists(temp_html):
-                    os.remove(temp_html)
-                await page.close()
-                await context.close()
-
-            return output_path
-        except Exception as e:
-            logger.error(f"[Endfield Render] Playwright error: {e}")
-            return None
-
     async def close(self):
-        if Renderer._cache_cleanup_task and not Renderer._cache_cleanup_task.done():
-            Renderer._cache_cleanup_task.cancel()
-            Renderer._cache_cleanup_task = None
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        pass
