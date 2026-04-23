@@ -70,10 +70,47 @@ class Renderer:
                 return_url=False,
                 options=render_options,
             )
+            if result and not self._validate_image(result):
+                return None
             return result
         except Exception as e:
             logger.error(f"[Endfield Render] html_render error: {e}")
             return None
+
+    # PNG / JPEG / WebP 文件头魔数
+    _IMAGE_SIGNATURES = (
+        b"\x89PNG",      # PNG
+        b"\xff\xd8\xff",  # JPEG
+        b"RIFF",          # WebP (RIFF....WEBP)
+    )
+
+    @staticmethod
+    def _validate_image(path: str) -> bool:
+        """检查文件是否为有效图片（通过文件头魔数）。"""
+        if not isinstance(path, str) or not os.path.isfile(path):
+            return True  # 非本地路径（如 URL），跳过验证
+        try:
+            with open(path, "rb") as f:
+                header = f.read(12)
+            if len(header) < 3:
+                logger.error(f"[Endfield Render] 图片文件过小 ({len(header)} bytes): {path}")
+                return False
+            if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+                return True
+            if any(header.startswith(sig) for sig in Renderer._IMAGE_SIGNATURES[:2]):
+                return True
+            preview = header[:200]
+            try:
+                text_preview = preview.decode("utf-8", errors="replace")
+            except Exception:
+                text_preview = repr(preview)
+            logger.error(
+                f"[Endfield Render] 渲染结果非有效图片: {path}, 文件头: {text_preview}"
+            )
+            return False
+        except OSError as e:
+            logger.error(f"[Endfield Render] 读取渲染结果失败: {path}, {e}")
+            return False
 
     def _adapt_template(self, content: str) -> str:
         """Converts Yunzai (art-template) syntax to Jinja2."""
