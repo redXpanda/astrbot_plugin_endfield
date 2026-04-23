@@ -2,6 +2,7 @@ import os
 import re
 import base64
 import mimetypes
+import json
 import jinja2
 from astrbot.api.star import Star
 from astrbot.api import logger
@@ -70,11 +71,19 @@ class Renderer:
                 return_url=False,
                 options=render_options,
             )
-            if result and not self._validate_image(result):
+            if not result:
+                logger.error(
+                    f"[Endfield Render] html_render returned empty result: {template_name}"
+                )
+                return None
+            if not self._validate_image(result, template_name):
                 return None
             return result
         except Exception as e:
-            logger.error(f"[Endfield Render] html_render error: {e}")
+            logger.error(
+                f"[Endfield Render] html_render error: {template_name}, {e}",
+                exc_info=True,
+            )
             return None
 
     # PNG / JPEG / WebP 文件头魔数
@@ -85,32 +94,64 @@ class Renderer:
     )
 
     @staticmethod
-    def _validate_image(path: str) -> bool:
+    def _validate_image(path: str, template_name: str = "") -> bool:
         """检查文件是否为有效图片（通过文件头魔数）。"""
         if not isinstance(path, str) or not os.path.isfile(path):
             return True  # 非本地路径（如 URL），跳过验证
         try:
+            size = os.path.getsize(path)
             with open(path, "rb") as f:
-                header = f.read(12)
+                payload_head = f.read(2048)
+            header = payload_head[:12]
             if len(header) < 3:
-                logger.error(f"[Endfield Render] 图片文件过小 ({len(header)} bytes): {path}")
+                logger.error(
+                    "[Endfield Render] 图片文件过小: "
+                    f"template={template_name}, size={size} bytes, path={path}"
+                )
                 return False
             if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
                 return True
             if any(header.startswith(sig) for sig in Renderer._IMAGE_SIGNATURES[:2]):
                 return True
-            preview = header[:200]
-            try:
-                text_preview = preview.decode("utf-8", errors="replace")
-            except Exception:
-                text_preview = repr(preview)
+
+            text_preview = Renderer._describe_non_image_payload(payload_head)
             logger.error(
-                f"[Endfield Render] 渲染结果非有效图片: {path}, 文件头: {text_preview}"
+                "[Endfield Render] 渲染结果非有效图片: "
+                f"template={template_name}, size={size} bytes, path={path}, "
+                f"header_hex={header.hex(' ')}, payload={text_preview}"
             )
             return False
         except OSError as e:
-            logger.error(f"[Endfield Render] 读取渲染结果失败: {path}, {e}")
+            logger.error(
+                f"[Endfield Render] 读取渲染结果失败: template={template_name}, path={path}, {e}"
+            )
             return False
+
+    @staticmethod
+    def _describe_non_image_payload(payload_head: bytes) -> str:
+        """提取非图片响应正文，帮助定位 t2i 服务实际失败原因。"""
+        text = payload_head.decode("utf-8", errors="replace").strip()
+        if not text:
+            return repr(payload_head[:200])
+
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                interesting = {
+                    key: data.get(key)
+                    for key in ("error", "message", "msg", "detail", "code", "data")
+                    if key in data
+                }
+                if interesting:
+                    return json.dumps(interesting, ensure_ascii=False)[:500]
+        except Exception:
+            pass
+
+        text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:500]
 
     def _adapt_template(self, content: str) -> str:
         """Converts Yunzai (art-template) syntax to Jinja2."""
